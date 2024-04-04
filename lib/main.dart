@@ -1,60 +1,74 @@
-import 'dart:async';
-import 'dart:convert';
+// Import necessary packages
 import 'package:flutter/material.dart';
+import 'package:get/get.dart';
+import 'package:hive/hive.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 import 'package:http/http.dart' as http;
-import 'package:provider/provider.dart';
-import 'package:sqflite/sqflite.dart';
-import 'package:path_provider/path_provider.dart';
 
-void main() {
-  runApp(
-    ChangeNotifierProvider(
-      create: (context) => DataModel(),
-      child: MyApp(),
-    ),
-  );
+// Main function
+void main() async {
+  // Initialize Hive
+  await Hive.initFlutter();
+
+  // Register Hive adapter
+  Hive.registerAdapter(ItemAdapter());
+
+  // Open Hive box
+  await Hive.openBox<Item>('items');
+
+  // Run the app
+  runApp(MyApp());
 }
 
+// MyApp class
 class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
+    return GetMaterialApp(
       title: 'Refactor Task App',
       theme: ThemeData(primarySwatch: Colors.blue),
+      darkTheme: ThemeData.dark(),
+      themeMode: ThemeMode.system,
       home: MyHomePage(),
     );
   }
 }
 
+// MyHomePage class
 class MyHomePage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    final dataModel = Provider.of<DataModel>(context);
+    // Get instance of DataController
+    final DataController dataController = Get.put(DataController());
+
     return Scaffold(
       appBar: AppBar(title: Text('Refactor Task App')),
-      body: StreamBuilder<List<Item>>(
-        stream: dataModel.itemsStream,
-        builder: (context, snapshot) {
-          if (snapshot.hasData) {
-            return ListView.builder(
-              itemCount: snapshot.data?.length ?? 0,
-              itemBuilder: (context, index) {
-                final item = snapshot.data![index];
-                return ListTile(
-                  title: Text(item.title ?? ''),
-                  subtitle: Text(item.description ?? ''),
-                );
-              },
-            );
-          } else if (snapshot.hasError) {
-            return Center(child: Text('Error: ${snapshot.error}'));
-          } else {
-            return Center(child: CircularProgressIndicator());
-          }
-        },
-      ),
+      body: Obx(() {
+        if (dataController.isLoading.value) {
+          return Center(child: CircularProgressIndicator());
+        } else if (dataController.error.isNotEmpty) {
+          return Center(child: Text('Error: ${dataController.error}'));
+        } else {
+          final List<Item> items = dataController.items;
+          final bool isDarkMode = Get.isDarkMode;
+          return GridView.builder(
+            gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: Get.width ~/ 200,
+            ),
+            itemCount: items.length,
+            itemBuilder: (context, index) {
+              final item = items[index];
+              return ListTile(
+                title: Text(item.title ?? ''),
+                subtitle: Text(item.description ?? ''),
+                tileColor: isDarkMode ? Colors.grey[800] : Colors.white,
+              );
+            },
+          );
+        }
+      }),
       floatingActionButton: FloatingActionButton(
-        onPressed: dataModel.fetchAndStoreItems,
+        onPressed: dataController.fetchAndStoreItems,
         tooltip: 'Fetch Data',
         child: Icon(Icons.refresh),
       ),
@@ -62,84 +76,75 @@ class MyHomePage extends StatelessWidget {
   }
 }
 
-class DataModel extends ChangeNotifier {
-  final _itemsController = StreamController<List<Item>>.broadcast();
-  Database? _database;
+// DataController class
+class DataController extends GetxController {
+  // Observable variables
+  RxBool isLoading = true.obs;
+  RxString error = ''.obs;
 
-  Stream<List<Item>> get itemsStream => _itemsController.stream;
+  // Items list
+  RxList<Item> items = <Item>[].obs;
 
-  DataModel() {
-    _initDatabase();
+  @override
+  void onInit() {
+    super.onInit();
+    fetchItemsFromDatabase();
   }
 
-  Future<void> _initDatabase() async {
-    final documentsDirectory = await getApplicationDocumentsDirectory();
-    final path = '${documentsDirectory.path}/sample_app.db';
+  // Fetch items from API and store in local database
+  void fetchAndStoreItems() async {
+    try {
+      final response = await http
+          .get(Uri.parse('https://jsonplaceholder.typicode.com/posts'));
+      if (response.statusCode == 200) {
+        final List<Item> fetchedItems = (json.decode(response.body) as List)
+            .map((item) => Item.fromJson(item))
+            .toList();
 
-    _database = await openDatabase(path, version: 1, onCreate: (Database db, int version) async {
-      await db.execute('''
-        CREATE TABLE items (
-          id INTEGER PRIMARY KEY,
-          title TEXT,
-          description TEXT
-        )
-      ''');
-    });
+        final box = await Hive.openBox<Item>('items');
+        await box.clear();
+        await box.addAll(fetchedItems);
 
-    _fetchItemsFromDatabase();
-  }
-
-  Future<void> _fetchItemsFromDatabase() async {
-    final items = await _database?.query('items') ?? [];
-    final itemList = items.map((item) => Item.fromJson(item)).toList();
-    _itemsController.add(itemList);
-  }
-
-  Future<void> fetchAndStoreItems() async {
-    final response = await http.get(Uri.parse('https://jsonplaceholder.typicode.com/posts'));
-
-    if (response.statusCode == 200) {
-      final data = json.decode(response.body) as List;
-      final itemList = data.map((item) => Item.fromJson(item)).toList();
-      Batch batch = _database!.batch();
-      itemList.forEach((item) {
-        batch.insert('items', item.toJson(), conflictAlgorithm: ConflictAlgorithm.replace);
-      });
-
-      await batch.commit(noResult: true);
-      _itemsController.add(itemList);
-    } else {
-      _itemsController.addError('Failed to fetch data from API');
+        items.assignAll(fetchedItems);
+        isLoading.value = false;
+        error.value = '';
+      } else {
+        throw 'Failed to fetch data from API';
+      }
+    } catch (e) {
+      error.value = e.toString();
     }
   }
 
-  @override
-  void dispose() {
-    _itemsController.close();
-    super.dispose();
+  // Fetch items from local database
+  void fetchItemsFromDatabase() async {
+    final box = await Hive.openBox<Item>('items');
+    items.assignAll(box.values.toList());
+    isLoading.value = false;
   }
 }
 
-class Item {
+// Item class
+@HiveType(typeId: 0)
+class Item extends HiveObject {
+  @HiveField(0)
   final int id;
+
+  @HiveField(1)
   final String? title;
+
+  @HiveField(2)
   final String? description;
 
+  // Constructor
   Item({required this.id, this.title, this.description});
 
+  // FromJson method
   factory Item.fromJson(Map<String, dynamic> json) {
     return Item(
       id: json['id'],
       title: json['title'],
       description: json['body'],
     );
-  }
-
-  Map<String, dynamic> toJson() {
-    return {
-      'id': id,
-      'title': title,
-      'description': description,
-    };
   }
 }
